@@ -32,6 +32,9 @@ import pandas as pd
 from src.config import (
     RESULTS_DIR,
     DATA_DIR,
+    SNAPSHOT_UNIVERSE_DIR,
+    DATA_QUALITY_CONFIG,
+    MOMENTUM_CONFIG,
     CryptoConfig,
     USStockConfig,
     ARKConfig,
@@ -47,10 +50,12 @@ from src.ark_holdings import fetch_all_ark_holdings
 from src.sec_13f import fetch_all_13f_reference_data
 from src.backtest import run_single_asset_backtest, trades_to_dataframe
 from src.metrics import compute_performance_metrics, metrics_to_flat_rows
+from src.data_quality import validate_market_data
+from src.momentum_screen import compute_dual_momentum_screen, apply_momentum_screen
 
 logger = get_logger("main")
 
-CODE_VERSION = "0.1.0"
+CODE_VERSION = "0.2.0"
 
 
 def _save_df_csv(df: pd.DataFrame, filepath):
@@ -59,6 +64,48 @@ def _save_df_csv(df: pd.DataFrame, filepath):
         logger.info(f"已保存: {filepath}")
     except Exception as e:
         logger.error(f"保存文件失败 {filepath}: {e}")
+
+
+def _post_fetch_processing(market_name: str, universe_df, ohlcv_data: dict, summary: dict) -> dict:
+    """
+    抓取完成后的统一后处理：
+    1. 资产池快照按日期留档到 data/snapshots/universe/（成分快照长期
+       积累后可形成近似历史成分变更记录，缓解幸存者偏差不可追溯的问题）；
+    2. 数据质量校验（src/data_quality.py）：逐标的检测 OHLC 逻辑、
+       异常波动、缺口等，结果保存为 results/data_quality_<market>.csv，
+       只记录不改数据；
+    3. 双动量筛选（src/momentum_screen.py）：结果保存为
+       results/momentum_screen_<market>.csv，返回筛选后的回测数据集合
+       （未通过绝对动量过滤的标的不进入本次回测，但筛选记录完整留档）。
+
+    筛选关闭或数据为空时原样返回 ohlcv_data。
+    """
+    if universe_df is not None and len(universe_df) > 0:
+        date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+        archive_path = SNAPSHOT_UNIVERSE_DIR / f"{market_name}_universe_{date_tag}.csv"
+        _save_df_csv(universe_df, archive_path)
+
+    if DATA_QUALITY_CONFIG.enabled and ohlcv_data:
+        try:
+            quality_df = validate_market_data(ohlcv_data, market_name)
+            _save_df_csv(quality_df, RESULTS_DIR / f"data_quality_{market_name}.csv")
+            if len(quality_df) > 0:
+                summary["data_quality_total_issues"] = int(quality_df["issue_count"].sum())
+        except Exception as e:
+            logger.error(f"[{market_name}] 数据质量校验异常（不影响主流程）: {e}")
+
+    if MOMENTUM_CONFIG.enabled and ohlcv_data:
+        try:
+            screen_df = compute_dual_momentum_screen(ohlcv_data, MOMENTUM_CONFIG)
+            _save_df_csv(screen_df, RESULTS_DIR / f"momentum_screen_{market_name}.csv")
+            filtered = apply_momentum_screen(ohlcv_data, screen_df)
+            summary["momentum_screened_in"] = len(filtered)
+            summary["momentum_screened_out"] = len(ohlcv_data) - len(filtered)
+            return filtered
+        except Exception as e:
+            logger.error(f"[{market_name}] 双动量筛选异常（不影响主流程，回退为全量回测）: {e}")
+
+    return ohlcv_data
 
 
 def _run_market_backtests(
@@ -159,6 +206,8 @@ def run_crypto_pipeline(run_id: str):
     universe_path = RESULTS_DIR / "crypto_universe_snapshot.csv"
     _save_df_csv(universe_df, universe_path)
 
+    backtest_data = _post_fetch_processing("crypto", universe_df, ohlcv_data, summary)
+
     watchlist_rows = []
     metadata_rows = []
     fetched_at = utc_now_iso()
@@ -195,7 +244,7 @@ def run_crypto_pipeline(run_id: str):
     trades_df, metric_rows, backtest_errors = _run_market_backtests(
         market_name="crypto",
         universe_df=universe_df,
-        ohlcv_data=ohlcv_data,
+        ohlcv_data=backtest_data,
         fetch_errors=fetch_errors,
         strategy_cfg=strategy_cfg,
         initial_capital=cfg.initial_capital_usdt,
@@ -215,7 +264,8 @@ def run_crypto_pipeline(run_id: str):
             json.dump(metric_rows, f, ensure_ascii=False, indent=2, default=str)
 
     summary["errors"] = backtest_errors
-    summary["num_assets_processed"] = len(ohlcv_data)
+    summary["num_assets_fetched"] = len(ohlcv_data)
+    summary["num_assets_processed"] = len(backtest_data)
     summary["num_assets_failed"] = len(backtest_errors)
     return True, summary
 
@@ -241,6 +291,8 @@ def run_us_stock_pipeline(run_id: str):
     if len(universe_df) > 0:
         _save_df_csv(universe_df, RESULTS_DIR / "us_stock_dynamic_top20_snapshot.csv")
 
+    backtest_data = _post_fetch_processing("us_stock", universe_df, ohlcv_data, summary)
+
     watchlist_rows = []
     metadata_rows = []
     fetched_at = utc_now_iso()
@@ -261,8 +313,8 @@ def run_us_stock_pipeline(run_id: str):
             metadata_rows.append({
                 "symbol": symbol,
                 "market": "us_stock",
-                "start_date": str(df["date"].iloc[0]),
-                "end_date": str(df["date"].iloc[-1]),
+                "start_date": str(df["datetime"].iloc[0]),
+                "end_date": str(df["datetime"].iloc[-1]),
                 "num_rows": len(df),
                 "data_source": "yfinance",
                 "fetched_at": fetched_at,
@@ -277,7 +329,7 @@ def run_us_stock_pipeline(run_id: str):
     trades_df, metric_rows, backtest_errors = _run_market_backtests(
         market_name="us_stock",
         universe_df=universe_df,
-        ohlcv_data=ohlcv_data,
+        ohlcv_data=backtest_data,
         fetch_errors=fetch_errors,
         strategy_cfg=strategy_cfg,
         initial_capital=cfg.initial_capital_usd,
@@ -297,7 +349,8 @@ def run_us_stock_pipeline(run_id: str):
             json.dump(metric_rows, f, ensure_ascii=False, indent=2, default=str)
 
     summary["errors"].update(backtest_errors)
-    summary["num_assets_processed"] = len(ohlcv_data)
+    summary["num_assets_fetched"] = len(ohlcv_data)
+    summary["num_assets_processed"] = len(backtest_data)
     summary["num_assets_failed"] = len(backtest_errors)
 
     # ---- ARK 每日持仓（独立于回测，仅作为观察池来源）----
