@@ -14,6 +14,7 @@ import requests
 
 from src.config import (
     LOG_DIR,
+    SNAPSHOT_RAW_DIR,
     HTTP_TIMEOUT_SECONDS,
     HTTP_MAX_RETRIES,
     HTTP_BACKOFF_BASE_SECONDS,
@@ -56,6 +57,25 @@ def get_logger(name: str) -> logging.Logger:
 def utc_now_iso() -> str:
     """返回当前UTC时间的ISO 8601字符串表示，例如 2024-01-01T12:00:00+00:00。"""
     return datetime.now(timezone.utc).isoformat()
+
+
+def save_raw_snapshot(df, market: str, symbol: str):
+    """
+    把一份原始抓取结果按时间戳存档到 data/snapshots/raw/<market>/，
+    文件名形如 <symbol>_20261023T051500Z.csv，不覆盖历史版本，
+    用于复现某次运行实际使用的数据。保存失败不抛异常（返回 None），
+    快照只是留档手段，不能反过来中断主流程。
+    """
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        safe_symbol = str(symbol).replace("/", "-")
+        directory = os.path.join(SNAPSHOT_RAW_DIR, market)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{safe_symbol}_{ts}.csv")
+        df.to_csv(path, index=False)
+        return path
+    except Exception:
+        return None
 
 
 def generate_run_id() -> str:
