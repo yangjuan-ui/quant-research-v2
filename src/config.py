@@ -20,9 +20,17 @@ RESULTS_DIR = BASE_DIR / "results"
 DB_PATH = DATA_DIR / "quant_research.db"
 LOG_DIR = RESULTS_DIR / "logs"
 
+# 数据快照目录（可复现性）：原始抓取结果与资产池快照按时间戳留档，
+# 不覆盖历史版本，便于复现某次运行实际使用的数据。
+SNAPSHOT_DIR = DATA_DIR / "snapshots"
+SNAPSHOT_RAW_DIR = SNAPSHOT_DIR / "raw"
+SNAPSHOT_UNIVERSE_DIR = SNAPSHOT_DIR / "universe"
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(SNAPSHOT_RAW_DIR, exist_ok=True)
+os.makedirs(SNAPSHOT_UNIVERSE_DIR, exist_ok=True)
 
 
 # ------------------------------------------------------------------
@@ -69,6 +77,11 @@ class CryptoConfig:
     risk_per_trade_pct: float = 0.01    # 每笔交易风险占账户权益比例
     max_position_pct: float = 0.25      # 单资产最大名义仓位占账户权益比例
     allow_short: bool = False     # 不做空，仅现货多头
+    # 流动性过滤：最近 liquidity_window_days 天的日均成交额（close*volume）
+    # 低于此阈值（计价货币）的标的跳过并记录日志，避免低流动性标的让
+    # 滑点模型严重失真。设为 0 表示关闭该过滤。
+    min_avg_daily_quote_volume: float = 1_000_000.0
+    liquidity_window_days: int = 30
 
 
 CRYPTO_CONFIG = CryptoConfig()
@@ -167,8 +180,61 @@ class StrategyConfig:
 
     max_holding_days: int = 60  # 超时强制平仓的兜底天数，防止信号无限期悬挂
 
+    # 海龟/Donchian 通道突破（趋势分支的备选入场，策略类型记为 'donchian'）：
+    # 入场：趋势状态下收盘价突破此前 donchian_entry_period 根K线的最高价
+    # （通道用 shift(1) 的历史窗口计算，不含当根K线，无未来函数）；
+    # 退出：收盘价跌破此前 donchian_exit_period 根K线的最低价（通道退出），
+    # 同时保留 ATR 止损/追踪止损作为风险兜底，无固定止盈（与海龟原规则一致）。
+    donchian_enabled: bool = True
+    donchian_entry_period: int = 20
+    donchian_exit_period: int = 10
+
 
 STRATEGY_CONFIG = StrategyConfig()
+
+
+# ------------------------------------------------------------------
+# 数据质量配置
+# ------------------------------------------------------------------
+
+@dataclass
+class DataQualityConfig:
+    enabled: bool = True
+    # 单日涨跌幅绝对值超过该阈值记为异常波动告警（仅告警记录，不删数据）
+    anomaly_return_threshold: float = 0.5
+    # 标的历史K线少于该数量时跳过并记录日志：指标窗口（EMA50、ADX 的
+    # Wilder 平滑稳定期等）需要足够长的预热数据，硬跑只会产生噪声信号。
+    min_history_bars: int = 100
+    # 美股相邻交易日间隔超过该天数（日历日）记为疑似缺口告警
+    # （正常长周末+节假日一般不超过 4 天）
+    stock_gap_warn_days: int = 5
+    # 是否把每次运行的原始抓取结果按时间戳存档到 data/snapshots/raw/
+    save_raw_snapshots: bool = True
+
+
+DATA_QUALITY_CONFIG = DataQualityConfig()
+
+
+# ------------------------------------------------------------------
+# 双动量筛选配置（观察池二次筛选）
+# ------------------------------------------------------------------
+
+@dataclass
+class MomentumConfig:
+    # 双动量筛选：相对动量在观察池内排名 + 绝对动量过滤
+    # （回看期收益 <= absolute_threshold 的标的不进入本次回测集合）。
+    # 筛选只使用运行日之前已完成K线的数据，属于"运行时点"的观察池
+    # 精选，与市值池本身一样存在时点选择属性，必须在报告中披露；
+    # 它不改变单标的历史回测本身的无前视纪律。
+    enabled: bool = True
+    lookback_days: int = 252   # 约12个月交易日
+    skip_days: int = 21        # 跳过最近约1个月（经典 12-1 动量口径）
+    absolute_threshold: float = 0.0
+    # 历史不足 lookback+skip 的标的无法计算动量：不因筛选被剔除，
+    # 在筛选结果中标记为 insufficient_history 并保留在回测集合中。
+
+
+MOMENTUM_CONFIG = MomentumConfig()
 
 RISK_FREE_RATE_ANNUAL = 0.0  # Sharpe计算用的无风险利率假设，默认0，README需注明
 
