@@ -7,6 +7,10 @@ strategy.py
     趋势状态（trend）：ADX >= adx_trend_threshold
     震荡状态（range）：ADX <  adx_trend_threshold
 - 趋势策略（多头）：EMA_fast > EMA_slow，且收盘价高于EMA_fast，且处于趋势状态。
+- Donchian突破策略（多头，海龟法则变体）：趋势状态下，收盘价突破此前
+  donchian_entry_period 根K线的最高价通道；退出以跌破此前
+  donchian_exit_period 根K线最低价通道为主，ATR止损/追踪止损兜底，
+  无固定止盈。策略类型记录为 'donchian'，与 'trend' 分开统计。
 - 均值回归策略（多头）：RSI < rsi_oversold，且收盘价低于布林下轨，且处于震荡状态。
 - 本项目只做多，不做空（allow_short 配置项默认False，当前实现未包含做空逻辑）。
 
@@ -40,13 +44,17 @@ def generate_entry_signals(df: pd.DataFrame, strategy_cfg) -> pd.DataFrame:
     在带有指标的DataFrame基础上，追加以下列：
     - regime: 'trend' / 'range' / None
     - entry_signal_trend: bool，趋势策略多头入场信号
+    - entry_signal_donchian: bool，Donchian突破策略多头入场信号
     - entry_signal_range: bool，均值回归策略多头入场信号
     - entry_signal: bool，只要任一策略触发即为True（同一时间只允许一种策略生效，
-      若同时触发，优先采用趋势策略，因为其状态判定条件更明确；这是保守且
-      确定性的规则，避免信号冲突歧义）。
-    - entry_strategy_type: 'trend' / 'range' / None，记录具体是哪种策略触发。
+      若同时触发，优先级为 趋势 > Donchian > 均值回归：趋势策略的状态判定
+      条件最明确，Donchian次之；这是保守且确定性的规则，避免信号冲突歧义）。
+    - entry_strategy_type: 'trend' / 'donchian' / 'range' / None，
+      记录具体是哪种策略触发。
 
     所有判断仅依赖该行自身（即"当前已完成K线"）的指标值，不引用未来行。
+    Donchian通道列（donchian_upper_entry）在指标层已做 shift(1) 处理，
+    只含此前K线信息，因此收盘突破判定不构成未来函数。
     """
     out = df.copy()
     out["regime"] = classify_market_regime(out, strategy_cfg)
@@ -66,6 +74,14 @@ def generate_entry_signals(df: pd.DataFrame, strategy_cfg) -> pd.DataFrame:
         & (out["close"] > out["ema_fast"])
     )
 
+    donchian_cond = (
+        getattr(strategy_cfg, "donchian_enabled", False)
+        & indicators_ready
+        & (out["regime"] == "trend")
+        & out["donchian_upper_entry"].notna()
+        & (out["close"] > out["donchian_upper_entry"])
+    )
+
     range_cond = (
         indicators_ready
         & (out["regime"] == "range")
@@ -74,12 +90,14 @@ def generate_entry_signals(df: pd.DataFrame, strategy_cfg) -> pd.DataFrame:
     )
 
     out["entry_signal_trend"] = trend_cond
+    out["entry_signal_donchian"] = donchian_cond
     out["entry_signal_range"] = range_cond
-    out["entry_signal"] = trend_cond | range_cond
+    out["entry_signal"] = trend_cond | donchian_cond | range_cond
 
     strategy_type = pd.Series(index=out.index, dtype=object)
     strategy_type[trend_cond] = "trend"
-    strategy_type[~trend_cond & range_cond] = "range"
+    strategy_type[~trend_cond & donchian_cond] = "donchian"
+    strategy_type[~trend_cond & ~donchian_cond & range_cond] = "range"
     out["entry_strategy_type"] = strategy_type
 
     return out
@@ -229,10 +247,10 @@ def check_exit_conditions(
                           若同一根K线同时触及止损与止盈，止损优先，
                           这是backtest.py执行层面的规则，这里仅做条件判断）
       'take_profit'       止盈（仅趋势策略有固定止盈价）
-      'trend_inval
-
-'take_profit'       止盈（仅趋势策略有固定止盈价）
       'trend_invalid'      趋势条件失效（仅趋势策略）
+      'donchian_exit'      跌破Donchian退出通道（仅Donchian策略；
+                           通道为此前 donchian_exit_period 根K线最低价，
+                           按收盘价确认，与 trend_invalid 同为状态型退出）
       'mid_band_touch'     触及布林中轨（仅均值回归策略）
       'rsi_recovered'      RSI恢复至阈值以上（仅均值回归策略）
       'max_holding_days'   达到最大持仓天数（通用兜底规则，避免策略因
@@ -260,6 +278,23 @@ def check_exit_conditions(
 
         if trend_exit_condition_invalid(row):
             return True, "trend_invalid"
+
+        return False, None
+
+    elif strategy_type == "donchian":
+        # 海龟/Donchian：ATR止损（含追踪止损）优先兜底，其次通道退出。
+        # 无固定止盈（take_profit_price 对 donchian 恒为 None）。
+        effective_stop = stop_loss_price
+        if trailing_stop_price is not None and not pd.isna(trailing_stop_price):
+            effective_stop = max(stop_loss_price, trailing_stop_price) if stop_loss_price is not None else trailing_stop_price
+
+        if effective_stop is not None and row["low"] <= effective_stop:
+            return True, "stop_loss"
+
+        lower_exit = row.get("donchian_lower_exit")
+        if lower_exit is not None and not pd.isna(lower_exit):
+            if row["close"] < lower_exit:
+                return True, "donchian_exit"
 
         return False, None
 
