@@ -20,8 +20,8 @@ import time
 import pandas as pd
 import yfinance as yf
 
-from src.config import USStockConfig, HTTP_MAX_RETRIES, HTTP_BACKOFF_BASE_SECONDS
-from src.common import get_logger, http_get_with_retry, utc_now_iso
+from src.config import USStockConfig, HTTP_MAX_RETRIES, HTTP_BACKOFF_BASE_SECONDS, DATA_QUALITY_CONFIG
+from src.common import get_logger, http_get_with_retry, utc_now_iso, save_raw_snapshot
 
 logger = get_logger("us_stock_data")
 
@@ -212,8 +212,14 @@ def fetch_all_us_stock_data(cfg: USStockConfig):
         symbol = row["symbol"]
         try:
             df = fetch_ohlcv_history(symbol, start_date=cfg.start_date)
-            if len(df) < 30:
-                raise ValueError(f"数据量过少({len(df)}条)")
+            if DATA_QUALITY_CONFIG.save_raw_snapshots:
+                save_raw_snapshot(df, "us_stock", symbol)
+            if len(df) < DATA_QUALITY_CONFIG.min_history_bars:
+                raise ValueError(
+                    f"历史数据不足({len(df)}条 < 最低要求"
+                    f"{DATA_QUALITY_CONFIG.min_history_bars}条)，"
+                    f"指标预热不充分"
+                )
             data[symbol] = df
             logger.info(f"{symbol} 历史数据获取成功，共{len(df)}条。")
         except Exception as e:
