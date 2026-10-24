@@ -132,14 +132,39 @@ def adx(df: pd.DataFrame, window: int = 14) -> pd.Series:
     return adx_values
 
 
+def donchian_channels(df: pd.DataFrame, entry_period: int = 20, exit_period: int = 10):
+    """
+    Donchian 通道（海龟交易法则）：
+    - donchian_upper_entry：此前 entry_period 根K线最高价的最大值（入场通道）
+    - donchian_lower_exit：此前 exit_period 根K线最低价的最小值（退出通道）
+
+    关键的无前视处理：两个通道都对滚动窗口结果做了 shift(1)，
+    即第 t 根K线看到的通道只由 t 之前已完成K线构成，
+    因此"收盘价突破 donchian_upper_entry"在第 t 根收盘时即可判定，
+    不使用第 t 根自身的高低点污染通道（否则突破判定会自相矛盾）。
+    返回 (upper_entry, lower_exit) 两个 Series。
+    """
+    upper_entry = (
+        df["high"].rolling(window=entry_period, min_periods=entry_period)
+        .max().shift(1)
+    )
+    lower_exit = (
+        df["low"].rolling(window=exit_period, min_periods=exit_period)
+        .min().shift(1)
+    )
+    return upper_entry, lower_exit
+
+
 def compute_all_indicators(df: pd.DataFrame, strategy_cfg) -> pd.DataFrame:
     """
     汇总函数：在给定的OHLCV DataFrame基础上，追加以下指标列：
     ema_fast, ema_slow, atr, adx, rsi,
-    bb_middle, bb_upper, bb_lower
+    bb_middle, bb_upper, bb_lower,
+    donchian_upper_entry, donchian_lower_exit
 
     strategy_cfg 需提供属性：ema_fast, ema_slow, atr_window, adx_window,
-                            rsi_window, bollinger_window, bollinger_std
+                            rsi_window, bollinger_window, bollinger_std,
+                            donchian_entry_period, donchian_exit_period
 
     返回新的DataFrame（不修改原df），行顺序与输入一致。
     调用方在生成交易信号前，应确保指标非NaN的行才参与判断。
@@ -158,6 +183,14 @@ def compute_all_indicators(df: pd.DataFrame, strategy_cfg) -> pd.DataFrame:
     out["bb_middle"] = bb_mid
     out["bb_upper"] = bb_up
     out["bb_lower"] = bb_low
+
+    dc_up, dc_low = donchian_channels(
+        out,
+        entry_period=getattr(strategy_cfg, "donchian_entry_period", 20),
+        exit_period=getattr(strategy_cfg, "donchian_exit_period", 10),
+    )
+    out["donchian_upper_entry"] = dc_up
+    out["donchian_lower_exit"] = dc_low
 
     return out
 
