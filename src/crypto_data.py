@@ -16,8 +16,8 @@ import time
 import pandas as pd
 import ccxt
 
-from src.config import CryptoConfig, COINGECKO_MAX_CALLS_PER_MINUTE
-from src.common import get_logger, http_get_with_retry, utc_now_iso
+from src.config import CryptoConfig, COINGECKO_MAX_CALLS_PER_MINUTE, DATA_QUALITY_CONFIG
+from src.common import get_logger, http_get_with_retry, utc_now_iso, save_raw_snapshot
 
 logger = get_logger("crypto_data")
 
@@ -224,11 +224,42 @@ def fetch_ohlcv_history(
     return df[["datetime", "open", "high", "low", "close", "volume"]]
 
 
+def average_daily_quote_volume(df: pd.DataFrame, window_days: int) -> float:
+    """
+    最近 window_days 根K线的日均成交额（close * volume 的均值，
+    计价货币口径）。数据不足 window_days 时用实际可用根数计算。
+    """
+    if df is None or len(df) == 0:
+        return 0.0
+    tail = df.tail(window_days)
+    return float((tail["close"] * tail["volume"]).mean())
+
+
+def passes_liquidity_filter(df: pd.DataFrame, cfg: CryptoConfig):
+    """
+    流动性过滤：日均成交额低于 cfg.min_avg_daily_quote_volume 的标的
+    判定为不通过（低流动性下固定滑点假设会严重失真）。
+    阈值 <= 0 表示关闭过滤，恒通过。
+    返回 (passed: bool, avg_quote_volume: float)。
+    """
+    avg_qv = average_daily_quote_volume(df, cfg.liquidity_window_days)
+    if cfg.min_avg_daily_quote_volume <= 0:
+        return True, avg_qv
+    return avg_qv >= cfg.min_avg_daily_quote_volume, avg_qv
+
+
 def fetch_all_crypto_data(cfg: CryptoConfig):
     """
     构建资产池并逐一获取历史数据。
     返回 (universe_df, {symbol: ohlcv_df}, errors_dict)
     单个标的失败不影响其他标的继续处理。
+
+    每个成功获取的标的依次经过：
+    1. 原始数据时间戳快照留档（可复现性，失败不中断）；
+    2. 最小历史长度检查（DATA_QUALITY_CONFIG.min_history_bars）：
+       新上市、历史不足指标预热窗口的币种跳过并记录，不用 NaN 硬跑；
+    3. 流动性过滤（cfg.min_avg_daily_quote_volume）：低流动性标的
+       跳过并记录，避免滑点模型失真。
     """
     universe_df = build_crypto_universe(cfg)
     data = {}
@@ -243,8 +274,21 @@ def fetch_all_crypto_data(cfg: CryptoConfig):
                 timeframe=cfg.timeframe,
                 since_iso_utc=cfg.start_date_utc,
             )
-            if len(df) < 30:
-                raise ValueError(f"数据量过少({len(df)}条)，可能上市时间太短")
+            if DATA_QUALITY_CONFIG.save_raw_snapshots:
+                save_raw_snapshot(df, "crypto", symbol)
+            if len(df) < DATA_QUALITY_CONFIG.min_history_bars:
+                raise ValueError(
+                    f"历史数据不足({len(df)}条 < 最低要求"
+                    f"{DATA_QUALITY_CONFIG.min_history_bars}条)，"
+                    f"可能上市时间太短，指标预热不充分"
+                )
+            liquid, avg_qv = passes_liquidity_filter(df, cfg)
+            if not liquid:
+                raise ValueError(
+                    f"流动性不足：最近{cfg.liquidity_window_days}日日均成交额"
+                    f"{avg_qv:,.0f} < 阈值{cfg.min_avg_daily_quote_volume:,.0f}"
+                    f"（计价货币），滑点假设不可靠"
+                )
             data[symbol] = df
             logger.info(f"{symbol} 历史数据获取成功，共{len(df)}条。")
         except Exception as e:
