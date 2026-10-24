@@ -248,7 +248,7 @@ def run_single_asset_backtest(
             if position_qty > 0 and open_trade is not None:
                 holding_bars += 1
 
-                if open_trade.strategy_type == "trend":
+                if open_trade.strategy_type in ("trend", "donchian"):
                     trailing_stop_price = update_trailing_stop(
                         current_trailing_stop=trailing_stop_price,
                         current_close=row["close"],
@@ -281,8 +281,9 @@ def run_single_asset_backtest(
                     elif exit_reason == "mid_band_touch":
                         exit_price_raw = row["bb_middle"]
                     else:
-                        # trend_invalid / rsi_recovered / max_holding_days
-                        # 均按本根K线收盘价成交（因为是基于收盘后状态判断的退出）
+                        # trend_invalid / donchian_exit / rsi_recovered /
+                        # max_holding_days 均按本根K线收盘价成交
+                        # （因为是基于收盘后状态判断的退出）
                         exit_price_raw = row["close"]
 
                     open_trade.holding_bars = holding_bars
